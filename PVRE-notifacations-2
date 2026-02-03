@@ -38,13 +38,16 @@ def lambda_handler(event: S3Event, context: LambdaContext):
                 continue
 
             for obj in page["Contents"]:
-                key = obj["Key"]
-                # Filter for files containing 'summary' (case-insensitive)
-                # and exclude folders (keys ending with '/')
-                if "summary" in key.lower() and not key.endswith("/"):
-                    summary_files.append({
-                        "Key": key,
-                        "LastModified": obj["LastModified"],
+    key = obj["Key"]
+    # Filter for files inside 'Summary/' folder (case-insensitive)
+    # and exclude the folder itself (keys ending with '/')
+    if "/summary/" in key.lower() and not key.endswith("/"):
+        summary_files.append({
+            "Key": key,
+            "LastModified": obj["LastModified"],
+            "Size": obj["Size"]
+        })
+
                         "Size": obj["Size"]
                     })
 
