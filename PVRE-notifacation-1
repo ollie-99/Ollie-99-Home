@@ -1,0 +1,300 @@
+import json
+import os
+from datetime import datetime
+from io import BytesIO, StringIO
+
+import boto3
+import pandas as pd
+from aws_lambda_powertools.utilities.data_classes import S3Event, event_source
+from aws_lambda_powertools.utilities.typing import LambdaContext
+
+# Initialize AWS clients
+s3_client = boto3.client("s3")
+cloudwatch_client = boto3.client("cloudwatch")
+sns_client = boto3.client("sns")
+
+# Environment variables
+SNS_TOPIC_ARN = os.environ.get(
+    "SNS_TOPIC_ARN", "arn:aws:sns:eu-north-1:913197190925:PVRE-RedHost-Alerts"
+)
+# S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME', 'test-pvre-data-bucket')
+
+
+@event_source(data_class=S3Event)
+def lambda_handler(event: S3Event, context: LambdaContext):
+    bucket_name = event.bucket_name
+    try:
+        # Get the latest file from the S3 bucket
+        print(f"Listing files in bucket: {bucket_name}")
+        response = s3_client.list_objects_v2(Bucket=bucket_name)
+
+        if "Contents" not in response:
+            raise ValueError(f"No files found in bucket: {bucket_name}")
+
+        # Sort by LastModified to get the latest file
+        files = sorted(response["Contents"], key=lambda x: x["LastModified"], reverse=True)
+        latest_file = files[0]
+
+        print(f'Latest file: {latest_file["Key"]}')
+        print(f'Last Modified: {latest_file["LastModified"]}')
+        print(f'Size: {latest_file["Size"]} bytes')
+
+        # Read the latest file from S3
+        file_obj = s3_client.get_object(Bucket=bucket_name, Key=latest_file["Key"])
+        file_bytes = file_obj["Body"].read()
+
+        # Determine file type and read accordingly
+        file_name = latest_file["Key"].lower()
+
+        if file_name.endswith(".xlsx") or file_name.endswith(".xls"):
+            # Excel file - read directly with pandas
+            print("Detected Excel file format")
+            df = pd.read_excel(BytesIO(file_bytes), engine="openpyxl")
+            file_type = "Excel"
+
+        else:
+            # CSV/TSV file - try multiple encodings
+            print("Detected CSV/TSV file format")
+            encodings_to_try = ["utf-8", "latin-1", "iso-8859-1", "windows-1252", "cp1252"]
+            csv_content = None
+            used_encoding = None
+
+            for encoding in encodings_to_try:
+                try:
+                    csv_content = file_bytes.decode(encoding)
+                    used_encoding = encoding
+                    print(f"Successfully decoded file using {encoding} encoding")
+                    break
+                except UnicodeDecodeError:
+                    continue
+
+            if csv_content is None:
+                raise ValueError("Could not decode file with any supported encoding")
+
+            # Detect the separator by checking the first line
+            lines = csv_content.splitlines()
+            first_line = lines[0]
+            if "\t" in first_line:
+                separator = "\t"
+                print("Detected tab-separated file")
+            else:
+                separator = ","
+                print("Detected comma-separated file")
+
+            # Read the file with detected separator
+            df = pd.read_csv(StringIO(csv_content), sep=separator)
+            file_type = f"CSV/TSV ({used_encoding})"
+
+        print(f"Loaded {len(df)} rows with {len(df.columns)} columns")
+
+        # Clean column names - remove trailing spaces and non-breaking spaces
+        df.columns = df.columns.str.strip().str.replace("\xa0", "")
+
+        print(f"Cleaned column names: {df.columns.tolist()}")
+
+        # Check which columns exist
+        required_columns = ["Host_Name", "Host_Class", "status"]
+        missing_columns = [col for col in required_columns if col not in df.columns]
+
+        if missing_columns:
+            raise ValueError(f"Missing required columns: {missing_columns}")
+
+        # Extract columns we need (B, C, G, I, K)
+        columns_to_extract = ["Host_Name", "Host_Class", "status", "ip_address", "CTI"]
+        available_columns = [col for col in columns_to_extract if col in df.columns]
+        df_filtered = df[available_columns].copy()
+
+        # Debug: Show sample status values
+        print(f'Sample status values: {df_filtered["status"].head(10).tolist()}')
+        print(f'Unique status values: {df_filtered["status"].unique().tolist()}')
+
+        # Clean the status column - remove extra spaces and handle NaN
+        df_filtered["status"] = df_filtered["status"].fillna("").astype(str).str.strip().str.lower()
+
+        # Filter for Red hosts based on status column (Column I)
+        red_hosts = df_filtered[df_filtered["status"] == "red"].copy()
+        yellow_hosts = df_filtered[df_filtered["status"] == "yellow"].copy()
+        green_hosts = df_filtered[df_filtered["status"] == "green"].copy()
+
+        red_count = len(red_hosts)
+        yellow_count = len(yellow_hosts)
+        green_count = len(green_hosts)
+
+        print(f"Status Summary - Red: {red_count}, Yellow: {yellow_count}, Green: {green_count}")
+
+        # Send metrics to CloudWatch
+        send_cloudwatch_metrics(red_count, yellow_count, green_count)
+
+        # Send alert if there are Red hosts
+        if red_count > 0:
+            print(f"Sending alert for {red_count} Red hosts")
+            send_alert_notification(
+                red_hosts, red_count, yellow_count, green_count, latest_file["Key"]
+            )
+        else:
+            print("No Red hosts found - skipping alert")
+
+        return {
+            "statusCode": 200,
+            "body": json.dumps(
+                {
+                    "message": "Processing completed successfully",
+                    "file_processed": latest_file["Key"],
+                    "file_type": file_type,
+                    "last_modified": str(latest_file["LastModified"]),
+                    "total_hosts": len(df),
+                    "processed_hosts": len(df_filtered),
+                    "red_hosts": red_count,
+                    "yellow_hosts": yellow_count,
+                    "green_hosts": green_count,
+                }
+            ),
+        }
+
+    except Exception as e:
+        print(f"Error processing file: {str(e)}")
+        import traceback
+
+        traceback.print_exc()
+        return {"statusCode": 500, "body": json.dumps({"error": str(e)})}
+
+
+def send_cloudwatch_metrics(red_count, yellow_count, green_count):
+    try:
+        metric_data = [
+            {
+                "MetricName": "RedHosts",
+                "Value": red_count,
+                "Unit": "Count",
+                "Timestamp": datetime.now(),
+            },
+            {
+                "MetricName": "YellowHosts",
+                "Value": yellow_count,
+                "Unit": "Count",
+                "Timestamp": datetime.now(),
+            },
+            {
+                "MetricName": "GreenHosts",
+                "Value": green_count,
+                "Unit": "Count",
+                "Timestamp": datetime.now(),
+            },
+            {
+                "MetricName": "TotalHosts",
+                "Value": red_count + yellow_count + green_count,
+                "Unit": "Count",
+                "Timestamp": datetime.now(),
+            },
+        ]
+
+        cloudwatch_client.put_metric_data(Namespace="PVRE/HostMetrics", MetricData=metric_data)
+
+        print("CloudWatch metrics sent successfully")
+
+    except Exception as e:
+        print(f"Error sending CloudWatch metrics: {str(e)}")
+
+
+def send_alert_notification(red_hosts_df, red_count, yellow_count, green_count, filename):
+    try:
+        display_limit = 50
+        red_hosts_display = red_hosts_df.head(display_limit)
+        host_class_summary = red_hosts_df.groupby("Host_Class").size().sort_values(ascending=False)
+
+        total_hosts = red_count + yellow_count + green_count
+        current_time = datetime.now().strftime("%d/%m/%Y %H:%M:%S UTC")
+
+        subject = f"PVRE ALERT: {red_count} Red Hosts Require Patching"
+
+        lines = []
+
+        # Header
+        lines.append("========================================================================")
+        lines.append("                   PVRE HOST MONITORING ALERT")
+        lines.append("========================================================================")
+        lines.append("")
+
+        # Summary
+        lines.append("SUMMARY")
+        lines.append("------------------------------------------------------------------------")
+        lines.append(f"File:           {filename}")
+        lines.append(f"Date/Time:      {current_time}")
+        lines.append(f"Total Hosts:    {total_hosts}")
+        lines.append("")
+        lines.append(f"Red Hosts:      {red_count}  (Out of Date - Action Required)")
+        lines.append(f"Yellow Hosts:   {yellow_count}  (Expiring Soon)")
+        lines.append(f"Green Hosts:    {green_count}  (Compliant)")
+        lines.append("")
+
+        # Host Class Summary
+        lines.append("========================================================================")
+        lines.append("RED HOSTS BY HOST CLASS")
+        lines.append("========================================================================")
+        lines.append("")
+
+        for host_class, count in host_class_summary.items():
+            lines.append(f"  {host_class}")
+            lines.append(f"    Count: {count}")
+            lines.append("")
+
+        # Red Hosts Details
+        lines.append("========================================================================")
+        lines.append(f"RED HOSTS DETAILS ({min(display_limit, red_count)} of {red_count})")
+        lines.append("========================================================================")
+        lines.append("")
+
+        for idx, row in red_hosts_display.iterrows():
+            lines.append(f'HOST: {row["Host_Name"]}')
+            lines.append(f'  Host Class:  {row["Host_Class"]}')
+            lines.append("  Status:      RED (Out of Date)")
+
+            if "ip_address" in row and pd.notna(row["ip_address"]):
+                lines.append(f'  IP Address:  {row["ip_address"]}')
+
+            if "CTI" in row and pd.notna(row["CTI"]):
+                lines.append(f'  CTI:         {row["CTI"]}')
+
+            lines.append("")
+
+        if red_count > display_limit:
+            lines.append(f"... and {red_count - display_limit} more hosts")
+            lines.append("")
+
+        # Action Required
+        lines.append("========================================================================")
+        lines.append("ACTION REQUIRED")
+        lines.append("========================================================================")
+        lines.append("")
+        lines.append("The hosts listed above are out of date for patching.")
+        lines.append("Please take the following actions:")
+        lines.append("")
+        lines.append("  1. Review the Red hosts list")
+        lines.append("  2. Prioritize by Host Class criticality")
+        lines.append("  3. Schedule maintenance windows")
+        lines.append("  4. Execute patching procedures")
+        lines.append("  5. Verify completion in next report")
+        lines.append("")
+        lines.append("========================================================================")
+        lines.append("PVRE Host Monitoring System | CloudWatch: PVRE/HostMetrics")
+        lines.append("========================================================================")
+
+        newline_char = chr(10)
+        message = newline_char.join(lines)
+
+        print(f"Attempting to publish to SNS topic: {SNS_TOPIC_ARN}")
+
+        if SNS_TOPIC_ARN:
+            sns_response = sns_client.publish(
+                TopicArn=SNS_TOPIC_ARN, Subject=subject, Message=message
+            )
+            print(f"Alert sent via SNS for {red_count} Red hosts")
+            print(f'SNS MessageId: {sns_response["MessageId"]}')
+        else:
+            print("SNS_TOPIC_ARN not configured - skipping email alert")
+
+    except Exception as e:
+        print(f"Error sending alert notification: {str(e)}")
+        import traceback
+
+        traceback.print_exc()
